@@ -7,7 +7,7 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from src import MovieUploadInfo, MovieDataResponse, ProcessConfig, MovieProcessingReport, HealthResponse, log_requests, setup_logging
 from data_pipeline import create_cleaning_report, process_data, validate_dataframe
 from src import (
-MovieStorage
+MovieStorage, MovieCache
 )
 from src.storage import MOVIE_COLUMNS
 
@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Data Processing API", version="1.0.0")
 app.middleware("http")(log_requests)
 storage = MovieStorage()
+cache = MovieCache()
 
 @app.get("/health", response_model=HealthResponse)
 def health_check():
@@ -33,7 +34,6 @@ async def upload_movies(file: UploadFile = File(...)):
     try:
         contents = await file.read()
         df = pd.read_csv(io.BytesIO(contents))
-    
     except pd.errors.EmptyDataError:
         logger.warning(f"File is empty: {file_name}")
         raise HTTPException(status_code=400, detail="File is empty")
@@ -43,8 +43,6 @@ async def upload_movies(file: UploadFile = File(...)):
     except UnicodeDecodeError:
         logger.warning(f"Decoding failed: {file_name}")
         raise HTTPException(status_code=400, detail="Decoding failed")
-    
-
     if df.empty:
         logger.warning(f"Empty file: {file_name}")
         raise HTTPException(status_code=400, detail="Empty file")
@@ -53,20 +51,27 @@ async def upload_movies(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Mismatched columns")
     df = df[MOVIE_COLUMNS]
     storage.save(df)
-
+    cache.invalidate()
     logger.info(f"Uploaded dataset: filename={file_name}, rows={len(df)}")
-    return {
-            "filename": file_name,"rows": len(df), "columns": len(df.columns) ,"column_names": list(df.columns)}
+    return {"filename": file_name,"rows": len(df), "columns": len(df.columns) ,"column_names": list(df.columns)}
 
 
 
 @app.get("/movies", response_model=MovieDataResponse)
 def get_movies(limit: int = Query(default=100, ge=1)):
     """Return up to limit movies and the total number stored."""
+    cached = cache.get(limit)
+    if cached is not None:
+        logger.info(f"Returned cached movies: limit={limit}")
+        return cached
     records = storage.select_columns(MOVIE_COLUMNS, limit)
     total_rows = storage.count_movies()
+    response = {"data": records, "total_rows": total_rows}
+    cache.set(limit, response)
     logger.info(f"Retrieved movies: returned_rows={len(records)}, total_rows={total_rows}")
-    return {"data": records, "total_rows": total_rows}
+    return response
+
+
 
 @app.get("/movies/search", response_model=list[dict])
 def query_movies( columns: list[str] = Query(default=["title"]), min_rating: float = Query(default=0, ge=0, le=10), limit: int = Query(default=100, ge=1)):
@@ -108,6 +113,7 @@ def process_movies(config: ProcessConfig):
         raise HTTPException(status_code=400, detail=str(error))
 
     storage.save(cleaned_df)
+    cache.invalidate()
     logger.info(f"Processed movies: validation_removed={validation_rows_removed}, " f"rows_before={report['rows_before']}, rows_after={report['rows_after']}")
 
     return {"validation_rows_removed": validation_rows_removed, "cleaning_report": report}
